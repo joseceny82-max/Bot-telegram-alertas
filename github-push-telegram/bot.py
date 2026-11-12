@@ -1,4 +1,4 @@
-"""GitHub push alerts -> Telegram.
+"""GitHub push and Railway deployment alerts -> Telegram.
 
 GitHub sends push webhooks to this service. The signature, repository and
 branch are checked before the push is forwarded to Telegram.
@@ -18,6 +18,8 @@ from typing import Any
 import aiohttp
 from aiohttp import web
 from dotenv import load_dotenv
+
+from railway_events import deployment, format_deployment
 
 load_dotenv()
 
@@ -39,6 +41,9 @@ GITHUB_REPOS = csv(os.getenv("GITHUB_REPOS", ""))
 WATCHED_BRANCHES = csv(os.getenv("WATCHED_BRANCHES", "main,master"))
 PORT = int(os.getenv("PORT", "8080"))
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/github/webhook")
+RAILWAY_WEBHOOK_SECRET = os.getenv("RAILWAY_WEBHOOK_SECRET", "").strip()
+RAILWAY_PROJECT_IDS = csv(os.getenv("RAILWAY_PROJECT_IDS", ""))
+RAILWAY_ENVIRONMENTS = csv(os.getenv("RAILWAY_ENVIRONMENTS", "production"))
 
 MAX_TELEGRAM_MESSAGE = 4096
 MAX_COMMITS_IN_MESSAGE = 20
@@ -72,19 +77,24 @@ def format_push(payload: dict[str, Any]) -> str:
     sender = (payload.get("sender") or {}).get("login") or (payload.get("pusher") or {}).get("name") or "alguien"
     compare_url = payload.get("compare") or repository.get("html_url") or ""
     commits = payload.get("commits") or []
+    authors = list(dict.fromkeys(str((c.get("author") or {}).get("name") or "") for c in commits))
+    authors = [name for name in authors if name]
 
     lines = [
         "🚀 <b>Nuevo push</b>",
         f"<b>{esc(full_name)}</b> · <code>{esc(branch)}</code>",
         f"👤 {esc(sender)} · {len(commits)} commit{'s' if len(commits) != 1 else ''}",
     ]
+    if authors:
+        lines.append("✍️ Autor: " + ", ".join(esc(name[:80]) for name in authors[:4]))
     if compare_url:
         lines.append(f'<a href="{esc(compare_url)}">Ver cambios en GitHub</a>')
 
     if commits:
         lines.append("")
         for commit in commits[:MAX_COMMITS_IN_MESSAGE]:
-            message = str(commit.get("message") or "").splitlines()[0]
+            message_lines = str(commit.get("message") or "").splitlines()
+            message = message_lines[0] if message_lines else "(sin mensaje)"
             sha = str(commit.get("id") or "")[:7]
             url = commit.get("url") or compare_url
             lines.append(f'• <a href="{esc(url)}"><code>{esc(sha)}</code></a> {esc(message)}')
@@ -127,7 +137,8 @@ class Telegram:
                 return False
             except (aiohttp.ClientError, TimeoutError):
                 if attempt == 2:
-                    log.exception("No se pudo contactar con Telegram")
+                    # Las excepciones HTTP pueden contener la URL con el token.
+                    log.error("No se pudo contactar con Telegram")
                     return False
                 await asyncio.sleep(2**attempt)
         return False
@@ -139,6 +150,27 @@ class Telegram:
 
 def create_app(telegram: Telegram) -> web.Application:
     deliveries: deque[str] = deque(maxlen=1000)
+    pending: dict[str, asyncio.Task] = {}
+
+    async def deliver(key: str, message: str) -> web.Response:
+        if key in deliveries:
+            return web.json_response({"ok": True, "duplicate": True})
+        task = pending.get(key)
+        if task is None:
+            if len(pending) >= 100:
+                return web.json_response({"error": "ocupado"}, status=503)
+            task = asyncio.create_task(telegram.send(message))
+            pending[key] = task
+        try:
+            accepted = await asyncio.shield(task)
+        finally:
+            if task.done():
+                pending.pop(key, None)
+        if not accepted:
+            return web.json_response({"error": "Telegram no aceptó el mensaje"}, status=502)
+        if key not in deliveries:
+            deliveries.append(key)
+        return web.json_response({"ok": True})
 
     async def health(_request: web.Request) -> web.Response:
         return web.json_response({"ok": True, "service": "github-telegram-alerts"})
@@ -149,9 +181,6 @@ def create_app(telegram: Telegram) -> web.Application:
             return web.json_response({"error": "firma inválida"}, status=401)
 
         delivery_id = request.headers.get("X-GitHub-Delivery", "")
-        if delivery_id and delivery_id in deliveries:
-            return web.json_response({"ok": True, "duplicate": True})
-
         event = request.headers.get("X-GitHub-Event", "")
         if event != "push":
             return web.json_response({"ok": True, "ignored": event or "unknown event"})
@@ -160,6 +189,8 @@ def create_app(telegram: Telegram) -> web.Application:
             payload = await request.json()
         except (ValueError, aiohttp.ContentTypeError):
             return web.json_response({"error": "JSON inválido"}, status=400)
+        if not isinstance(payload, dict) or not isinstance(payload.get("repository"), dict):
+            return web.json_response({"error": "push inválido"}, status=400)
 
         repository = payload.get("repository") or {}
         full_name = str(repository.get("full_name") or "")
@@ -171,19 +202,36 @@ def create_app(telegram: Telegram) -> web.Application:
         if payload.get("deleted") or not payload.get("commits"):
             return web.json_response({"ok": True, "ignored": "empty or deleted push"})
 
-        if delivery_id:
-            deliveries.append(delivery_id)
-        if not await telegram.send(format_push(payload)):
-            if delivery_id in deliveries:
-                deliveries.remove(delivery_id)
-            return web.json_response({"error": "Telegram no aceptó el mensaje"}, status=502)
-        return web.json_response({"ok": True})
+        key = "github:" + (delivery_id or hashlib.sha256(body).hexdigest())
+        return await deliver(key, format_push(payload))
+
+    async def railway_webhook(request: web.Request) -> web.Response:
+        if not RAILWAY_WEBHOOK_SECRET or not RAILWAY_PROJECT_IDS or not RAILWAY_ENVIRONMENTS:
+            return web.json_response({"error": "Railway no configurado"}, status=503)
+        expected = ("Bearer " + RAILWAY_WEBHOOK_SECRET).encode("utf-8")
+        supplied = request.headers.get("Authorization", "").encode("utf-8")
+        if not hmac.compare_digest(supplied, expected):
+            return web.json_response({"error": "no autorizado"}, status=401)
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise ValueError("JSON inválido")
+            event, reason = deployment(payload, RAILWAY_PROJECT_IDS, RAILWAY_ENVIRONMENTS)
+        except (ValueError, aiohttp.ContentTypeError):
+            return web.json_response({"error": "despliegue inválido"}, status=400)
+        if event is None:
+            return web.json_response({"ok": True, "ignored": reason})
+        return await deliver(event["key"], format_deployment(event))
 
     app = web.Application()
     app.router.add_get("/health", health)
     app.router.add_post(WEBHOOK_PATH, github_webhook)
+    app.router.add_post("/railway/webhook", railway_webhook)
 
     async def cleanup(_app: web.Application) -> None:
+        for task in list(pending.values()):
+            task.cancel()
+        await asyncio.gather(*pending.values(), return_exceptions=True)
         await telegram.close()
 
     app.on_cleanup.append(cleanup)
@@ -198,6 +246,8 @@ def validate_config() -> None:
         missing.append("TELEGRAM_CHAT_ID")
     if not GITHUB_WEBHOOK_SECRET:
         missing.append("GITHUB_WEBHOOK_SECRET")
+    if RAILWAY_WEBHOOK_SECRET and (len(RAILWAY_WEBHOOK_SECRET) < 32 or not RAILWAY_PROJECT_IDS or not RAILWAY_ENVIRONMENTS):
+        raise SystemExit("Railway necesita un secreto de 32 caracteres y proyectos y entornos permitidos")
     if missing:
         raise SystemExit("Faltan variables en .env: " + ", ".join(missing))
 
